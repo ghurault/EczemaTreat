@@ -1,0 +1,586 @@
+---
+title: "Analyse treatment recommendations"
+author: "Guillem Hurault"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+params:
+  score: "SCORAD"
+  min_time: 14
+  exclude_patients: FALSE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE)
+
+# Args:
+# - score: Which score to optimise
+# - min_time Only consider observations with Time >= min_time (to allow the model to be sufficiently trained)
+```
+
+# Introduction
+
+```{r init}
+source(here::here("analysis", "00_init.R")) # Load libraries, variables and functions
+library(latex2exp)
+
+## Where the predictions recommendations are saved
+filename <- get_recommendation_files(outcome = "SCORAD",
+                                     model = paste0("FullModel", "_h004"),
+                                     dataset = "PFDC",
+                                     val_horizon = 1)$RecFile
+##
+lrec <- readRDS(here(filename))
+
+score_dict <- detail_POSCORAD(params$score)
+```
+
+## Utility function
+
+We aim to maximise a utility function (or equivalently minimise a loss function), which we define in terms of reward as:
+```{r utility-function}
+utility_from_reward <- function(r, pw = 1) {
+  # Utility as a function of reward
+  # Utility is an increasing function of the reward.
+  # The reward is assumed > 0.
+  #
+  # Args:
+  # r: reward
+  # pw: power of the exponent
+  #
+  # Returns
+  # Utility
+  
+  return(r^pw)
+}
+
+utility_func <- function(y, cost, M = score_dict$Maximum, ...) {
+  # Utility function as a function of the state (score) and cost of the action
+  # The pair (score, cost) is first linearly transformed into a reward, between 0 and 1,
+  # where y=0 corresponds to reward=1 and y=M corresponds to reward=0.
+  # (y + cost) is censored at 0 and M so the reward is always in [0, 1]
+  # NB: instead of defining utility as a function of the action, we directly input the cost of the action.
+  #
+  # Args:
+  # y: score value
+  # cost: cost of the action
+  # M: maximum value that the score can take
+
+  (1 - (y + cost) / M) %>%
+    pmin(., 1) %>%
+    pmax(., 0) %>%
+    utility_from_reward(...)
+}
+```
+
+```{r plot-utility, include=FALSE, eval=FALSE}
+data.frame(Reward = seq(0, 1, .01)) %>%
+  mutate(Utility = utility_from_reward(Reward)) %>%
+  ggplot(aes(x = Reward, y = Utility)) +
+  geom_line()
+```
+
+Where `y` correspond the score of interest (e.g. `r params$score`) and `cost` correspond to the cost of the action, in the unit of the score.
+We can interpret the `cost` as the minimum decrease in the score that would expect in order to choose the action.
+
+We consider two treatments, "localTreatment" and "emollientCream", and we express the `cost` as a function which treatment is used:
+$\mathit{cost = localTreatment * cost_{localTreatment} +
+emollientCream * cost_{emollientCream} +
+localTreatment * emollientCream * cost_{bothTreatment}}$
+
+Where:
+
+- $\mathit{localTreatment} \in \{0,1\}$ and $\mathit{emollientCream} \in \{0,1\}$ indicate whether "localTreatment" and "emollientCream" were used, respectively.
+- $\mathit{cost_{localTreatment}}$ and $\mathit{cost_{emollientCream}}$ are the costs assiocated with using "localTreatment" and "emollientCream", respectively.
+- $\mathit{cost_{bothTreatment}}$ is the additional cost of using both treatment simultaneously.
+
+### Possible improvement
+
+- The utility function could be strictly concave (like the utility of money): e.g. if we assume that the benefit of improving from SCORAD=50 to SCORAD=40 is greater than the benefit of improving from SCORAD=10 to SCORAD=0.
+This would be more or less equivalent to saying that the cost is a function of `y` (lower cost when `y` is high because patients may be less afraid of side effects when their condition is already severe?), but I find it's a bit "weird" to have the cost depend on the state...
+
+```{r eval=FALSE, include=FALSE}
+# Using utility function similar to the parametric function that is often used for money
+
+min_RSS <- function(data, par) {
+  # Find values for coefficients of utility function assuming we know two points (u, r) stored in data
+  # b = par[1], c = par[2]
+  with(data, sum((u - par[1] * log(1 + par[2] * r))^2))
+}
+hpar_utility <- optim(par = c(0.5, 0.5),
+                      min_RSS,
+                      data = data.frame(u = c(0.5, 1),
+                                        r = c(0.9, 1)))$par
+
+utility_from_reward <- function(r, b = hpar_utility[1], c = hpar_utility[2]) {
+  stopifnot(r > (-1 / c))
+  return(b * log(1 + r * c))
+}
+```
+
+## Decision analysis
+
+The decision analysis consists in computing the utility under different actions, and choosing the action that maximises the expected utility:
+
+$a = \operatorname{argmax}\big( E(U(a)) \big)$
+
+Alternatively, we can maximise a different objective function than the expected utility.
+Notably, we can use a risk-sensitive objective function, where risk can be defined as the variance of the utility $V(U)$.
+For instance,
+
+$a = \operatorname{argmax}\big( E(U(a)) - q * \sqrt{V(U(a))} \big)$
+
+Where $q$ can be interpreted as a risk tolerance.
+$q > 0$ corresponds to an agent that is risk averse (penalises uncertainty) when $q < 0$ corresponds to an agent that is risk seeking (welcoming uncertainty).
+In this context, $q$ can also be interpreted as a z-score, assuming the utility is normally distributed.
+For instance, if $q = 1.96$, objective function is the lower bound of the 95% CI of the utility, i.e. the 2.5% quantile.
+$q > 0$ therefore corresponds to optimising a "worst-case" (we could view the risk averse agent as pessimistic, as the utility would be more likely greater than the maximisation objective).
+On the other hand, $q < 0$ encourages exploration of new treatments with uncertain effects (cf. exploration-exploitation trade-off).
+
+We can generate recommendations for different risk and cost profiles for example:
+
+```{r decision-parameters}
+decision_parameters <- expand_grid(
+  CostProfile = factor(c("F", "N", "H"), levels = c("F", "N", "H"), labels = c("No Cost", "Normal Cost", "High Cost")),
+  RiskProfile = factor(c("A", "N", "S"), levels = c("A", "N", "S"), labels = c("Risk Averse", "Risk Neutral", "Risk Seeking"))
+) %>%
+  mutate(DecisionProfile = 1:nrow(.)) %>%
+  mutate(
+    risk_tolerance = case_when(RiskProfile == "Risk Averse" ~ 1.5,
+                               RiskProfile == "Risk Neutral" ~ 0,
+                               RiskProfile == "Risk Seeking" ~ -1.5),
+    cost_localTreatment = case_when(CostProfile == "No Cost" ~ 0,
+                                    CostProfile == "Normal Cost" ~ 0.5,
+                                    CostProfile == "High Cost" ~ 3),
+    cost_emollientCream = cost_localTreatment,
+    cost_bothTreatment = case_when(CostProfile == "High Cost" ~ 3,
+                                   TRUE ~ 0)
+  )
+
+knitr::kable(decision_parameters)
+```
+
+## Evaluating recommendations
+
+While it is challenging to carefully evaluate recommendations in the absence of counterfactuals, a naive approach would be to assess the observed outcome of using treatment when patients' actions and our recommendations matched, vs when patients' actions and our recommendation differs.
+
+We computed the change in `r params$score`, $\Delta$ `r params$score` as an outcome measure (we cannot compute difference in utility as we don't have a "baseline" utility as it depends on the action) and compute patients compliance to our treatment recommendation.
+
+When considering treatment individually, we define compliance as the difference between our recommendation and what the patient actually used, with $\mathit{compliance} > 0$ meaning that we recommended more than what the patient used and $\mathit{compliance} < 0$ meaning that we recommended less than what the patient used.
+In any case, if the recommendations are "good" we would expect to observe a (negative) minimum in $\Delta$ `r params$score` for $\mathit{compliance} = 0$.
+
+If we consider both treatment, we compute compliance as the mean squared error (Brier Score) between our recommendations and the patient's actions.
+
+In practice, we don't observe whether the patient used treatment on a given day, but only whether he used treatment within the past two days.
+A limitation of the above method is that we have to rely the model inference about daily treatment usage to evaluate the model's recommendations.
+
+### Questions
+
+- Only consider observations with high confidence in treatment usage estimates?
+- Need to control for confounders? Maybe keep it simple, don't try to overinterpret these results.
+
+# Results
+
+```{r processing}
+# Load results
+actions <- lrec$Actions %>%
+  mutate(ActionLabel = glue::glue("({localTreatment},{emollientCream})"))
+actions <- tibble(ActionLabel = c("(0,0)", "(0,1)", "(1,0)", "(1,1)"),
+                  ActionExpression = list(TeX(r'(($\bar{C}$,$\bar{E}$))'),
+                                          TeX(r'(($\bar{C}$,$E$))'),
+                                          TeX(r'(($C$,$\bar{E}$))'),
+                                          TeX(r'(($C$,$E$))'))) %>%
+  left_join(actions, ., by = "ActionLabel") %>%
+  arrange(localTreatment, emollientCream) %>%
+  mutate(ActionLabel = factor(ActionLabel, levels = ActionLabel))
+
+pred_rec <- lrec$Predictions %>%
+  rename(Prediction = all_of(score_dict$Label)) %>%
+  select(Patient, Time, Prediction, localTreatment_post, emollientCream_post)
+
+POSCORAD <- load_PFDC()$POSCORAD %>%
+  rename(Time = Day)
+
+# Compute observed change in score (outcome)
+df_rec <- POSCORAD %>%
+  rename(Score = all_of(score_dict$Label)) %>%
+  group_by(Patient) %>%
+  mutate(Change = lead(Score) - Score) %>%
+  ungroup() %>%
+  select(Patient, Time, Score, Change)
+pred_rec <- left_join(pred_rec, df_rec, by = c("Patient", "Time"))
+
+# Process posterior probability of using treatment
+pred_rec <- pred_rec %>%
+  mutate(localTreatment_post = vapply(localTreatment_post, mean, numeric(1)),
+         emollientCream_post = vapply(emollientCream_post, mean, numeric(1)))
+```
+
+## Treatment usage
+
+During data exploration, we noticed that patients mostly answered "no" to the question "did you use treatment within the past two days?" for "emollientCream" or "localTreatment".
+However, "emollientCream" was the prefered treatment "used within the past two days" rather than "localTreatment".
+
+We confirmed this from the inference of daily treatment usage.
+
+```{r plot-treatment, message=FALSE}
+treat_summary <- pred_rec %>%
+  select(Patient, Time, localTreatment_post, emollientCream_post) %>%
+  pivot_longer(cols = all_of(c("localTreatment_post", "emollientCream_post")),
+               names_to = "Treatment",
+               values_to = "MeanDailyUsageProb") %>%
+  mutate(Treatment = gsub("_post", "", Treatment)) %>%
+  group_by(Patient, Treatment) %>%
+  summarise(MeanUsage = mean(MeanDailyUsageProb),
+            PropDeterministic = mean(MeanDailyUsageProb == 0 | MeanDailyUsageProb == 1),
+            Prop0 = mean(MeanDailyUsageProb == 0),
+            Prop1 = mean(MeanDailyUsageProb == 1),
+            PropQuasi0 = mean(MeanDailyUsageProb < 0.1),
+            PropQuasi1 = mean(MeanDailyUsageProb > 0.9)) %>%
+  ungroup()
+
+lapply(c("MeanUsage", "PropDeterministic", "Prop0", "Prop1"),
+       function(x) {
+         treat_summary %>%
+           select(all_of(c("Patient", "Treatment", x))) %>%
+           pivot_wider(names_from = "Treatment", values_from = x) %>%
+           ggplot(aes(x = localTreatment, y = emollientCream)) +
+           geom_point() +
+           geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+           coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+           labs(title = x)
+       }) %>%
+  plot_grid(plotlist = ., ncol = 2)
+```
+
+Most patients do not use one or the two treatments.
+In the heatmap below, a cross indicates that the average frequency of daily treatment usage is less than 5%.
+
+- 6/16 patients almost never use "emollientCream"
+- 7/16 patients almost never use "localTreatment"
+- 6/16 patients almost never use "emollientCream" and "localTreatment"
+
+```{r avg-treatment-usage}
+treat_summary %>%
+  mutate(Patient = factor(Patient),
+         Label = ifelse(MeanUsage < 0.05, "X", "")) %>%
+  ggplot(aes(x = Treatment, y = Patient, fill = MeanUsage, label = Label)) +
+  geom_raster() +
+  geom_text() +
+  scale_fill_distiller(limits = c(0, 1), direction = 1) +
+  coord_cartesian(expand = FALSE) +
+  labs(x = "") +
+  theme_classic(base_size = 15)
+```
+
+To assess our treatment recommendations, it is advisable not to consider patients who always/never use treatments, patients who only use one type of treatments or patients for whom a lot of "daily treatment usage" cannot be infer accurately (so that results will be less sensitive to the imputation.) 
+
+```{r eligible-patient}
+# Patients who always/never use treatment
+excl_patients <- lapply(c("localTreatment", "emollientCream"),
+                        function(x) {
+                          treat_summary %>%
+                            filter(Treatment == x,
+                                   Prop0 > 0.9 | PropQuasi0 > 0.9 |Prop1 > 0.9 | PropQuasi1 > 0.9) %>%
+                            pull(Patient)
+                        }) %>%
+  unlist() %>%
+  unique() %>%
+  sort()
+```
+
+NB: in the current setup, patients will `r ifelse(!params$exclude_patients, "not", "")` be excluded.
+
+## Treatment recommendation
+
+```{r compute-recommendations}
+# Utility of actions for the different profiles
+df_utility <- lapply(1:nrow(decision_parameters),
+                     function(i) {
+                       
+                       # Compute total cost of actions
+                       tmp_costs <- bind_cols(decision_parameters[i, ],
+                                              actions) %>%
+                         mutate(Cost = localTreatment * cost_localTreatment +
+                                  emollientCream * cost_emollientCream +
+                                  localTreatment * emollientCream * cost_bothTreatment)
+                       
+                       # Compute utility of actions
+                       tmp_utility <- lapply(1:nrow(tmp_costs),
+                                             function(a) {
+                                               pred_rec %>%
+                                                 mutate(Utility = map(Prediction, function(x) {utility_func(x[, a], tmp_costs$Cost[a])}),
+                                                        Mean = map(Utility, mean) %>% as.numeric(),
+                                                        SD = map(Utility, sd) %>% as.numeric(),
+                                                        MeanPrediction = map(Prediction, mean) %>% as.numeric(),
+                                                        Action = a) %>%
+                                                 select(-Prediction, -Utility)
+                                             }) %>%
+                         bind_rows()
+                       
+                       return(left_join(tmp_utility, tmp_costs, by = "Action"))
+                       
+                     }) %>%
+  bind_rows()
+
+# Optimal actions
+opt_action <- df_utility %>%
+  mutate(MaxObjective = Mean - risk_tolerance * SD) %>%
+  group_by(DecisionProfile, Patient, Time) %>%
+  filter(MaxObjective == max(MaxObjective)) %>%
+  ungroup()
+
+# Compute compliance ("distance" between suggested action and actual action as measured by Brier Score)
+opt_action <- opt_action %>%
+  mutate(
+    Compliance_localTreatment = localTreatment - localTreatment_post,
+    Compliance_emollientCream = emollientCream - emollientCream_post,
+    Compliance = 0.5 * (Compliance_localTreatment^2 + Compliance_emollientCream^2)
+  )
+
+# Subset recommendation results
+perf_rec <- opt_action %>%
+  filter(Time >= params$min_time) %>%
+  # filter(!(Patient %in% excl_patients)) %>%
+  drop_na()
+if (params$exclude_patients) {
+  perf_rec <- filter(perf_rec, !(Patient %in% excl_patients))
+}
+
+# Risk Neutral, Normal Cost
+perf_rec1 <- perf_rec %>%
+  filter(RiskProfile == "Risk Neutral", CostProfile == "Normal Cost")
+```
+
+### Which actions are most often recommended?
+
+Unsurprisingly, when the cost of treatment is high, the optimal decision is to not use any treatment.
+On the other hand, when using treatment is "free", since the treatment effects are negative ($\operatorname{Prob}(\mathit{TreatmentEffect} < 0) \approx 1$), the optimal decision is to use both treatments.
+
+For a "normal" cost of treatment (similar in magnitude to the treatment effects) and risk neutral agent, because the posterior mean treatment effect of localTreatment is always lower than emollientCream, using localTreatment will always be preferred.
+In fact, emollientCream will only be recommended as a supplementary treatment, in addition to localTreatment.
+
+The recommendation pattern does not change much when the patient is risk averse or risk seeking, even though we can observe that a risk averse patient would be less likely to use the "no treatment" option than the risk neutral patient; and the risk seeking patient would be more likely to use "no treatment" than the risk neutral patient.
+
+```{r plot-frequency-actions}
+freq_action <- perf_rec %>%
+  group_by(RiskProfile, CostProfile, Action) %>%
+  summarise(Freq = n()) %>%
+  ungroup() %>%
+  group_by(RiskProfile, CostProfile) %>%
+  mutate(Freq = Freq / sum(Freq))
+freq_action <- decision_parameters %>%
+  select(CostProfile, RiskProfile) %>%
+  expand_grid(Action = 1:4) %>%
+  full_join(freq_action, b = c("RiskProfile", "CostProfile", "Action")) %>%
+  mutate(Freq = replace_na(Freq, 0))
+pfa <- freq_action %>%
+  full_join(actions, by = "Action") %>%
+  ggplot(aes(x = ActionLabel, y = Freq)) +
+  facet_grid(rows = vars(RiskProfile), cols = vars(CostProfile)) + # labeller = label_both
+  geom_col() +
+  scale_x_discrete(labels = parse(text = actions[["ActionExpression"]] %>% unlist())) +
+  coord_cartesian(ylim = c(0, 1), expand = FALSE) +
+  labs(x = "Action", y = "Frequency of action")
+pfa
+# ggsave(here("results", "freq_recommendations.jpg"), width = 13, height = 8, units = "cm", scale = 2, dpi = 300)
+# saveRDS(pfa, file = here("results", "subplot_recommendation.rds"))
+```
+
+### Are recommendations changing as more data comes in?
+
+While the recommendations are influenced by the decision profiles, it is also possible that they are changing as more data comes in.
+Here we investigate the frequency of recommended actions as a function of a time (training day) for a "normal" treatment cost and a risk neutral patient.
+
+We can see that the frequency of the "using both treatment" action is decreasing with training data.
+On the other hand, "using localTreatment" and "using no treatment" becomes more recommended as more data comes in.
+
+This evolution of recommendations may be explained by the fact that the treatment effects becomes less uncertain with more training data, thus yielding different recommendations.
+However, it is also possible that the change in recommendations could be explained by change in the data distribution (average severity decreases in the new training data).
+
+```{r plot-evolution-recommendations, message=FALSE, warning=FALSE}
+evol_rec <- opt_action %>%
+  filter(CostProfile == "Normal Cost", RiskProfile == "Risk Neutral") %>%
+  group_by(Time, ActionLabel) %>%
+  summarise(N = n())
+diff <- actions %>%
+  select(ActionLabel) %>%
+  expand_grid(Time = 1:max(evol_rec[["Time"]])) %>%
+  setdiff(., evol_rec %>% select(Time, ActionLabel)) %>%
+  mutate(N = 0)
+evol_rec <- bind_rows(evol_rec, diff) %>%
+  group_by(Time) %>%
+  mutate(N_tot = sum(N)) %>%
+  ungroup() %>%
+  mutate(Prop = N / N_tot)
+
+p_rec1 <- evol_rec %>%
+  ggplot(aes(x = Time, y = Prop, colour = ActionLabel)) +
+  geom_smooth(method = "loess", se = FALSE) +
+  scale_y_continuous(limits = c(0, 1), expand = expansion(.01)) +
+  scale_colour_manual(values = cbbPalette, labels = actions[["ActionExpression"]]) +
+  labs(x = "Training day",y = "Frequency of the recommendation", colour = "Action")
+p_rec1
+# ggsave(here("results", "evolution_recommendations.jpg"), width = 13, height = 8, units = "cm", dpi = 300, scale = 1.5)
+```
+
+### How are recommendations influenced by the current score?
+
+When multiple actions can be recommended, as in the "Normal" cost profile, the recommendations can be different even if the current score is the same, highlighting that the recommendations are "personalised", even if the treatment parameters are not.
+This is likely due to difference in the breakdown of PO-SCORAD and measurement error (different latent score can be associated with the measurements, and a latent score close to a cutpoint is more likely to lead to a measurable improvement).
+
+Also, we can observe that, for this decision profile:
+
+- when the score is low, "no treatment" is more likely to be recommended
+- when the score is high, "both treatment" is more likely to be recommended
+
+We can observe that we are more likely to recommend treatment when the score is higher that when the score is lower, even though the utility function are linear (with linear treatment effects, the benefit is the same regardless of the score) and not concave.
+This may be interpreted as a side effect of estimating different treatment effects for each severity item, and that when the score is higher, more signs are likely to be present, making the condition more treatable (if a new sign is more treatable than the previous sign, the benefit would appear higher on average).
+It is also possible that "using both treatment" when the score is high is confounded by the fact that this action is more recommended when there is little training data and that earlier iteration corresponds to more severe eczema.
+
+```{r distribution-action-score}
+p_rec2 <- perf_rec1 %>%
+  ggplot(aes(x = Score, colour = ActionLabel)) +
+  geom_density() +
+  scale_colour_manual(values = cbbPalette, drop = FALSE, labels = actions[["ActionExpression"]]) +
+  scale_y_continuous(expand = expansion(c(0, .05))) +
+  scale_x_continuous(limits = c(0, NA)) +
+  labs(x = params$score, colour = "Action") +
+  theme_classic(base_size = 15)
+p_rec2
+# ggsave(here("results", "recommendations_vs_score.jpg"), width = 13, height = 8, units = "cm", dpi = 300, scale = 1.5)
+```
+
+```{r include=FALSE, eval=FALSE}
+# Figure for supplementary
+plot_grid(p_rec1 + theme(legend.position = "none"),
+          p_rec2 + theme(legend.position = "none"),
+          get_legend(p_rec1),
+          nrow = 1, labels = c("A", "B", ""), rel_widths = c(5, 5, 1))
+# ggsave(here("results", "recommendations_confounding.jpg"), width = 10, height = 5, units = "cm", dpi = 300, scale = 2.5, bg = "white")
+```
+
+### Compliance
+
+Because most patients do not used treatment, they apppear more compliant toward "not using treatment" recommendation that often happens when the cost of treatment is high.
+
+Note that not using treatment could be interpreted as:
+
+- a high (personal) cost of using treatment.
+- an unfavourable SCORAD breakdown (treatment effects is hetereogenous across AD severity items)
+- heterogenous treatment effects (not in the model)
+
+```{r plot-distribution-compliance}
+perf_rec %>%
+  drop_na() %>%
+  ggplot(aes(x = Compliance)) +
+  facet_grid(rows = vars(RiskProfile), cols = vars(CostProfile)) +
+  geom_density() +
+  coord_cartesian(xlim = c(0, 1), expand  = FALSE)
+```
+
+If we look at the average compliance for each patient, we noticed that our model for a neutral risk profile and a normal cost profile tend to recommend more "localTreatment" than what the patients used.
+"emollientCream" is more or less recommended depending on which patient we look at.
+
+```{r avg-compliance}
+perf_rec1 %>%
+  group_by(Patient) %>%
+  summarise(across(all_of(c("Compliance_localTreatment", "Compliance_emollientCream")), mean)) %>%
+  ungroup() %>%
+  ggplot(aes(x = Compliance_localTreatment, y = Compliance_emollientCream)) +
+  geom_point() +
+  coord_cartesian(xlim = c(-1, 1), ylim = c(-1, 1))
+```
+
+```{r compliance-confounding, include=FALSE, eval=FALSE}
+# Compliance localTreatment vs compliance emollientCream, averaged across time
+
+tmp <- perf_rec1 %>%
+  select(Patient, Time, Score, starts_with("Compliance_")) %>%
+  pivot_longer(cols = starts_with("Compliance_"), names_to = "Variable", values_to = "Value") %>%
+  mutate(Variable = gsub("Compliance_", "", Variable))
+
+# Compliance vs Score
+ggplot(data = tmp, aes(x = Score, y = Value, colour = Variable)) +
+  geom_smooth() +
+  coord_cartesian(ylim = c(-1, 1)) +
+  labs(y = "Compliance", colour = "")
+
+# Compliance vs time
+ggplot(data = tmp, aes(x = Time, y = Value, colour = Variable)) +
+  geom_smooth() +
+  coord_cartesian(ylim = c(-1, 1)) +
+  labs(y = "Compliance", colour = "")
+
+```
+
+#### Change vs Total compliance
+
+```{r plot-change-totcompliance}
+perf_rec %>%
+  drop_na() %>%
+  # filter(!between(localTreatment_post, .1, .9), !between(emollientCream_post, .1, .9)) %>%
+  ggplot(aes(x = Compliance, y = Change)) +
+  facet_grid(rows = vars(RiskProfile), cols = vars(CostProfile)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  coord_cartesian(xlim = c(0, 1))
+# ggsave(here("results", "recommendations_compliance.jpg"), width = 13, height = 8, units = "cm", dpi = 300, scale = 2)
+```
+
+#### Change vs Compliance for each treatment
+
+```{r plot-change-compliance, warning=FALSE}
+lapply(paste0("Compliance_", c("localTreatment", "emollientCream")),
+       function(x) {
+         perf_rec %>%
+           drop_na() %>%
+           # filter(!between(localTreatment_post, .1, .9), !between(emollientCream_post, .1, .9)) %>%
+           ggplot(aes_string(x = x, y = "Change")) +
+           facet_grid(rows = vars(RiskProfile), cols = vars(CostProfile)) +
+           geom_point() +
+           geom_smooth(method = "loess") +
+           coord_cartesian(ylim = c(-.5, .5) * score_dict$Maximum)
+       })
+```
+
+### Decision heatmap for a given (patient, time) recommendation
+
+The decision boundaries will change depending on the latent score, the breakdown of PO-SCORAD and the treatment estimates (so as a function of training data).
+
+The recommendation patient and time is cherry-picked to show the four actions (otherwise, using emollientCream but not localTreatment is rarely an option).
+
+```{r decision-heatmap}
+# Decision heatmap for a given observation
+
+tmp <- pred_rec %>%
+  # Select observation
+  filter(Patient == 14, Time == 18) %>%
+  #
+  expand_grid(actions) %>%
+  mutate(Prediction = map2(Prediction, Action, ~.x[, .y])) %>%
+  expand_grid(cost_eachTreatment = seq(0, 1.5, .01),
+              risk_tolerance = seq(-2, 2, .05)) %>%
+  mutate(cost_bothTreatment = 0,
+         Cost = localTreatment * cost_eachTreatment +
+           emollientCream * cost_eachTreatment +
+           localTreatment * emollientCream * cost_bothTreatment) %>%
+  mutate(Utility = map2(Prediction, Cost, ~utility_func(.x, .y)),
+         Mean = map(Utility, mean) %>% as.numeric(),
+         SD = map(Utility, sd) %>% as.numeric(),
+         MaxObjective = Mean - risk_tolerance * SD) %>%
+  select(-Prediction, -Utility) %>%
+  group_by(cost_eachTreatment, risk_tolerance) %>%
+  filter(MaxObjective == max(MaxObjective)) %>%
+  ungroup()
+
+ggplot(data = tmp,
+       aes(x = cost_eachTreatment, y = risk_tolerance, fill = ActionLabel)) +
+  geom_raster() +
+  scale_fill_manual(values = c("#999999", "#E69F00", "#56B4E9", "#009E73"),
+                    drop = FALSE,
+                    labels = actions[["ActionExpression"]]) +
+  # labels = actions[["ActionExpression"]]
+  coord_cartesian(expand = FALSE) +
+  labs(fill = "Action")
+```

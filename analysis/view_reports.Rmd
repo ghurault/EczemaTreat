@@ -1,0 +1,36 @@
+---
+title: "Analysis reports"
+author: "Guillem Hurault"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source(here::here(here::here("analysis", "00_init.R")))
+```
+
+You should open this file in the browser rather than in RStudio viewer, otherwise the relative paths may not work.
+
+# Fit
+
+```{r fit-table, results='asis', message=FALSE, echo=FALSE}
+available_models() %>%
+  mutate(Link = file.path("..", "docs", paste0("fit_", Score, "_", Model, "_", Dataset, ".html")),
+         Link = gsub("\\+", "%2B", Link), # cf. escape + in html address
+         Link = paste0("- [", Model, "](", Link, ")")) %>%
+  pull(Link) %>%
+  cat(sep = "\n")
+```
+
+# Validation
+
+```{r validation-table, results='asis', echo=FALSE}
+expand_grid(Score = detail_POSCORAD()$Name,
+            Dataset = c("PFDC")) %>%
+  mutate(File = file.path("..", "docs", paste0("perf4_", Score, "_", Dataset, ".html"))) %>%
+  # filter(file.exists(File)) %>%
+  mutate(Link = paste0("- [", Score, "](", File, ")")) %>%
+  pull(Link) %>%
+  cat(sep = "\n")
+```

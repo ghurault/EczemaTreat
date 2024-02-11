@@ -1,0 +1,668 @@
+---
+title: "Fit ScoradPred to data"
+author: "Guillem Hurault"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+params:
+  a0: 0.04
+  independent_items: FALSE
+  include_calibration: TRUE
+  include_treatment: TRUE
+  include_trend: FALSE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      fig.height = 5,
+                      fig.width = 8,
+                      dpi = 200)
+
+set.seed(2021) # Reproducibility (Stan use a different seed)
+
+source(here::here("analysis", "00_init.R")) # Load libraries, variables and functions
+
+score <- "SCORAD"
+dataset <- "PFDC"
+
+model <- ScoradPred(independent_items = params$independent_items,
+                    a0 = params$a0,
+                    include_trend = params$include_trend,
+                    include_calibration = params$include_calibration,
+                    include_treatment = params$include_treatment,
+                    treatment_names = c("localTreatment", "emollientCream"),
+                    include_recommendations = FALSE)
+
+param <- list_parameters(model)
+param2 <- list_parameters(model, full_names = TRUE)
+
+```
+
+```{r load-data, include=FALSE}
+# NB: atm copy-pasted from `run_fit.R` because we need `df`, `scorad` and especially `id` (when dealing with treatment)
+
+l <- load_PFDC()
+
+POSCORAD <- l$POSCORAD %>%
+  rename(Time = Day)
+df <- POSCORAD %>%
+  select(one_of("Patient", "Time", model$item_spec$Label)) %>%
+  pivot_longer(cols = all_of(model$item_spec$Label), names_to = "Label", values_to = "Score") %>%
+  drop_na()  %>%
+  left_join(model$item_spec[, c("Label", "ItemID")], by = c("Label"))
+
+# Prepare SCORAD calibration data
+if (model$include_calibration) {
+  cal <- scorad <- l$SCORAD %>%
+    rename(Time = Day) %>%
+    select(one_of("Patient", "Time", model$item_spec$Label)) %>%
+    pivot_longer(cols = all_of(model$item_spec$Label), names_to = "Label", values_to = "Score") %>%
+    drop_na()  %>%
+    left_join(model$item_spec[, c("Label", "ItemID")], by = c("Label")) 
+} else {
+  cal <- NULL
+}
+
+# Prepare treatment data
+treatment_lbl <- paste0(model$treatment_names, "WithinThePast2Days")
+if (model$include_treatment) {
+  treat <- POSCORAD %>%
+    select(all_of(c("Patient", "Time", treatment_lbl))) %>%
+    pivot_longer(cols = all_of(treatment_lbl), names_to = "Treatment", values_to = "UsageWithinThePast2Days") %>%
+    mutate(Treatment = vapply(Treatment, function(x) {which(x == treatment_lbl)}, numeric(1)) %>% as.numeric()) %>%
+    drop_na()
+} else {
+  treat <- NULL
+}
+
+# NB: assume no recommendation (at least outside time-series)
+
+pt <- unique(df[["Patient"]])
+
+id <- get_index(bind_rows(df, cal, treat))
+df <- left_join(df, id, by = c("Patient", "Time"))
+```
+
+```{r load-results, include=FALSE}
+file_dict <- get_results_files(outcome = score,
+                               model = model$name,
+                               dataset = dataset,
+                               root_dir = here())
+file_dict$PriorPar <- get_results_files(outcome = score,
+                                        model = "ScoradPred+corr",
+                                        dataset = dataset,
+                                        root_dir = here())$PriorPar
+
+fit <- readRDS(file_dict$Fit)
+par <- readRDS(file_dict$FitPar)
+par0 <- readRDS(file_dict$PriorPar)
+```
+
+# Model specifications: `r model$name`
+
+- Random walk `r if (params$include_trend) {"**with trend**"}` latent dynamic
+- `r ifelse(params$independent_items, "**No correlation**", "**Correlation**")` between intensity items
+`r if (params$include_calibration) {"- Calibration with SCORAD measurements"}`
+`r if (params$include_treatment) {"- Using treatment data"}`
+
+# Diagnostics
+
+```{r stan-diagnostics}
+check_hmc_diagnostics(fit)
+
+par %>%
+  select(Rhat) %>%
+  drop_na() %>%
+  summarise(max(Rhat),
+            all(Rhat < 1.1))
+
+lapply(1, # :model$D,
+       function(d) {
+         pairs(fit, pars = paste0(c("sigma_meas", "sigma_lat", "rho2", "sigma_tot", "mu_y0", "sigma_y0"), "[", d, "]"))
+       })
+plot(fit, pars = param2$Population[1], plotfun = "trace")
+# print(fit, pars = param$Population)
+```
+
+# Posterior estimates
+
+## Sensitivity to prior
+
+```{r prior-posterior}
+HuraultMisc::plot_prior_influence(par0, par, pars = c(param2$Population, param2$Patient)) +
+  # coord_cartesian(xlim = c(-1, 1)) +
+  theme(legend.position = "none")
+```
+
+## Measurement vs latent noise
+
+```{r estimates-dyn1-std, message=FALSE}
+plot_grid(
+  plot(fit, pars = "sigma_reltot") +
+    coord_cartesian(xlim = c(0, .25)) +
+    labs(title = "Normalised total standard deviation"),
+  plot(fit, pars = "rho2") +
+    coord_cartesian(xlim = c(0, 1)) +
+    labs(title = "Relative importance of measurement variance to total variance"),
+  nrow = 1)
+```
+
+```{r estimates-dyn2-std}
+tmp <- lapply(c("sigma_lat", "sigma_meas"),
+       function(x) {
+         
+         smp <- rstan::extract(fit, pars = x)[[1]]
+         
+         out <- model$item_spec %>%
+           mutate(Variable = x,
+                  Samples = lapply(1:nrow(.), function(i) {smp[, i]}),
+                  Samples = map2(Samples, M, ~(.x / .y)),
+                  Mean = map(Samples, mean) %>% unlist(),
+                  Lower = map(Samples, ~quantile(.x, probs = .05)) %>% unlist(),
+                  Upper = map(Samples, ~quantile(.x, probs = .95)) %>% unlist()) %>%
+           select(-Samples)
+         
+         return(out)
+         
+       }) %>%
+  bind_rows()
+
+tmp %>%
+  mutate(Variable = recode(Variable,
+                           "sigma_lat" = "Latent dynamic",
+                           "sigma_meas" = "Measurement"),
+         Component = gsub(" ", "\n", Component)) %>%
+  ggplot(aes(x = Name, y = Mean, ymin = Lower, ymax = Upper, colour = Variable)) +
+  facet_grid(rows = vars(Component), scales = "free", space = "free") +
+  geom_pointrange(position = position_dodge(width = .5)) +
+  coord_flip(ylim = c(0, .25)) +
+  scale_colour_manual(values = HuraultMisc::cbbPalette) +
+  labs(x = "", y = "Estimate (normalised)", colour = "Standard deviation:") +
+  theme(legend.position = "top")
+# ggsave(here("results", "dynamics_std.jpg"), width = 13, height = 8, units = "cm", dpi = 300, scale = 2)
+```
+
+## Measurement distribution cut-offs
+
+```{r estimates-cutoffs}
+plot(fit, pars = "ct1") + labs(title = "Cut-offs for extent, itching and sleep")
+plot(fit, pars = "ct2") + labs(title = "Cut-offs for intensity signs")
+plot(fit, pars = "delta1") + labs(title = "Normalised difference between cut-offs for extent, itching and sleep")
+```
+
+
+## Expected correlation matrices
+
+- Correlation of latent initial condition
+- Correlation of changes in latent scores
+
+```{r estimates-correlation, results='asis'}
+if (!model$independent_items) {
+    # Correlation matrix (expected value)
+  
+    lapply(c("Omega0", "Omega"),
+           function(x) {
+             omg <- rstan::extract(fit, pars = x)[[1]]
+             
+             tmp <- list(Mean = apply(omg, c(2, 3), mean),
+                         SD = apply(omg, c(2, 3), sd),
+                         Lower = apply(omg, c(2, 3), function(x) {quantile(x, probs = .05)}),
+                         Upper = apply(omg, c(2, 3), function(x) {quantile(x, probs = .95)}),
+                         pval = apply(omg, c(2, 3), function(x) {empirical_pval(x, 0)}))
+             tmp <- lapply(tmp,
+                           function(x) {
+                             colnames(x) <- model$item_spec$Name
+                             rownames(x) <- model$item_spec$Name
+                             return(x)
+             })
+             
+             corrplot::corrplot.mixed(tmp$Mean, lower = "number", upper = "ellipse", p.mat = tmp$pval, sig.level = 0.1)
+
+             # corrplot::corrplot(tmp$Mean, method = "ellipse") %>%
+             #   corrplot::corrRect(name = c("extent", "itching", "dryness", "thickening"))
+             
+             NULL
+           })
+  }
+```
+
+## Calibration
+
+### Estimates
+
+- `bias0` corresponds to the initial bias.
+The value is reported as a proportion to the maximum value that the score can take.
+`bias0 > 0` means that the clinician scores higher than the patient.
+- `tau_bias` is the time constant associated to the learning of the patient (whether the bias is reduced with time).
+  - `tau_bias >> 1` means that the patient does not learn and the bias stays constant.
+  - `tau_bias << 1` means bias goes to 0 very fast
+
+```{r estimates-calibration}
+if (model$include_calibration) {
+  
+  # + Visualise calibration time in PPC plot
+  
+  p1_cal <- par %>%
+    filter(Variable == "bias0") %>%
+    rename(ItemID = Index) %>%
+    left_join(model$item_spec, by = "ItemID") %>%
+    filter(!(Name %in% c("sleep", "itching"))) %>%
+    ggplot(aes(x = Name, y = Mean, ymin = `5%`, ymax = `95%`)) +
+    facet_grid(rows = vars(Component), scales = "free", space = "free") +
+    geom_pointrange() +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    coord_flip() +
+    scale_y_continuous(limits = c(-.5, .5)) +
+    labs(x = "",
+         y = "Initial bias (normalised)")
+  p2_cal <- par %>%
+    filter(Variable == "tau_bias") %>%
+    rename(ItemID = Index) %>%
+    left_join(model$item_spec, by = "ItemID") %>%
+    filter(!(Name %in% c("sleep", "itching"))) %>%
+    ggplot(aes(x = Name, y = Mean, ymin = `5%`, ymax = `95%`)) +
+    facet_grid(rows = vars(Component), scales = "free", space = "free") +
+    geom_pointrange() +
+    scale_y_log10(breaks = 10^(0:3)) +
+    coord_flip() +
+    labs(x = "", y = "Characteristic learning time")
+  
+  if (FALSE) {
+    ggsave(filename = here("results", "calibration_learningtime.jpg"),
+         plot = p2_cal,
+         width = 13, height = 8, units = "cm", dpi = 300, scale = 2)
+  }
+
+  plot_grid(p1_cal,
+            p2_cal +
+              theme(axis.text.y = element_blank(),
+                    axis.ticks.y = element_blank()),
+            nrow = 1,
+            rel_widths = c(.55, .45))
+  
+}
+```
+
+### Observed PO-SCORAD trajectories overlayed with a posteriori SCORAD trajectories
+
+A posteriori SCORAD (that the clinician would have scored) tends to be higher than the observed PO-SCORAD.
+However, the bias is not constant over time as the breakdown of SCORAD may change and learning may happen.
+
+NB: the width of the posterior distribution of SCORAD follows the assumption that SCORAD measurements std is half as much as PO-SCORAD measurements std.
+
+```{r calibration-trajectories}
+if (model$include_calibration) {
+  
+  aggcal <- rstan::extract(fit, pars = "agg_cal_rep")[[1]]
+  aggcal <- aggcal[, , 4] # SCORAD
+  
+  ### Plot observed PO-SCORAD and inferred SCORAD as a fanchart
+  pl <- lapply(sort(sample(pt, 4)),
+               function(pid) {
+                 
+                 tmp <- POSCORAD %>%
+                   filter(Patient == pid)
+                 
+                 plot_post_traj_fanchart(aggcal, id = id, patient_id = pid, max_score = 103) +
+                   add_broken_pointline(tmp, aes_x = "Time", aes_y = "SCORAD", colour = "Observed PO-SCORAD") +
+                   scale_colour_manual(values = c("Observed PO-SCORAD" = "black")) +
+                   labs(fill = "Inferred\nSCORAD\nprobabilities", colour = "", title = paste0("Patient ", pid)) +
+                   theme(legend.position = "none",
+                         legend.title = element_text(size = 12))
+                 
+               })
+  
+  plot_grid(get_legend(pl[[1]] + theme(legend.position = "top")),
+            plot_grid(plotlist = pl, ncol = 2),
+            ncol = 1, rel_heights = c(.1, .9))
+
+}
+```
+
+## Treatment
+
+```{r processing-treatment-estimates, include=FALSE}
+if (model$include_treatment) {
+  
+  param_treat <- list_parameters_treatment()
+  
+  # Process par: Treatment usage parameters
+  for (x in param_treat$Patient) {
+    par <- extract_par_indexes(par, var_name = x, dim_names = c("Patient", "Treatment"))
+  }
+  
+  # Process par: Treatment effects
+  par <- extract_par_indexes(par, var_name = "ATE", dim_names = c("ItemID", "Treatment"))
+  
+}
+```
+
+### Daily treatment usage
+
+#### Parameters
+
+```{r estimates-dailytreat}
+if (model$include_treatment) {
+  
+      # Plot patient parameters
+    par %>%
+      filter(Variable %in% param_treat$Patient) %>%
+      mutate(Treatment = model$treatment_names[Treatment],
+             Patient = factor(Patient, levels = pt)) %>%
+      ggplot(aes(x = Patient, y = Mean, ymin = `5%`, ymax = `95%`, colour = Treatment)) +
+      facet_grid(cols = vars(Variable)) +
+      geom_pointrange(position = position_dodge(width = .5)) +
+      coord_flip(ylim = c(0, 1)) +
+      scale_colour_manual(values = cbbPalette[c(2, 1)]) +
+      labs(y = x, colour = "") +
+      theme(legend.position = "top")
+
+    # Plot distribution of patient parameters
+    lapply(param_treat$Patient,
+           function(x) {
+             tmp <- rstan::extract(fit, pars = x)[[1]]
+             lapply(1:2,
+                    function(d) {
+                      PPC_group_distribution(tmp[, , d], x, nDraws = 50) +
+                        coord_cartesian(xlim = c(0, 1)) +
+                        labs(title = model$treatment_names[d])
+                    }) %>%
+               plot_grid(plotlist = ., nrow = 1)
+           }) %>%
+      plot_grid(plotlist = ., ncol = 1)
+    
+}
+```
+
+#### Average treatment usage
+
+```{r estimates-dailytreat-avg}
+if (model$include_treatment) {
+  # Average treatment usage for each patient
+  ptreat <- rstan::extract(fit, pars = "p_treat")[[1]]
+  lapply(pt,
+         function(pid) {
+           data.frame(Patient = pid,
+                      Treatment = model$treatment_names,
+                      AverageUsage = apply(ptreat[, id %>% filter(Patient == pid) %>% pull(Index), ], 3, mean))
+         }) %>%
+    bind_rows() %>%
+    pivot_wider(names_from = "Treatment", values_from = "AverageUsage") %>%
+    ggplot(aes(x = localTreatment, y = emollientCream)) +
+    geom_point() +
+    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1))
+}
+```
+
+```{r estimates-dailytreat-distribution , eval=FALSE}
+if (model$include_treatment) {
+  # Distribution of frequency of treatment usage
+  lapply(pt,
+         function(pid) {
+           avg_use <- apply(ptreat[, id %>% filter(Patient == pid) %>% pull(Index), ], c(1, 3), mean) %>%
+             reshape2::melt(., varnames = c("Sample", "Treatment"), value.name = "AverageUsage") %>%
+             mutate(Treatment = model$treatment_names[Treatment])
+           ggplot(data = avg_use,
+                  aes(x = AverageUsage, colour = Treatment)) +
+             geom_density() +
+             coord_cartesian(xlim = c(0, 1), expand = FALSE) +
+             labs(colour = "") +
+             theme(legend.position = "top")
+         }) %>%
+    plot_grid(plotlist = ., ncol = 4)
+}
+```
+
+### Treatment effects
+
+The average treatment effects is reported as a proportion of the maximum value that the score can take.
+Negative values indicate that using treatment reduces severity.
+For example, if ATE=-0.05 for extent (defined in [0, M=100]), it means that using treatment would reduce, on average, the severity of extent by 5 points.
+
+NB: to be compared to the total noise `sigma_reltot`, which yields an SNR of approx. 0.2.
+With a small effect size, it would be hard to detect a difference in performance or assess treatment recommendations.
+
+```{r estimates-ATE}
+if (model$include_treatment) {
+      # Prob(TreatEffect < 0)
+    apply(rstan::extract(fit, pars = "ATE")[[1]], c(2, 3), function(x) {mean(x < 0)})
+    
+    # Plot treatment effects
+    par %>%
+      filter(Variable == "ATE") %>%
+      mutate(Treatment = model$treatment_names[Treatment]) %>%
+      left_join(model$item_spec, by = "ItemID") %>%
+      ggplot(aes(x = Name, y = Mean, ymin = `5%`, ymax = `95%`, colour = Treatment)) +
+      facet_grid(rows = vars(Component), scale = "free", space = "free") +
+      geom_pointrange(position = position_dodge(width = .5)) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      coord_flip(ylim = c(-.05, .05)) +
+      scale_colour_manual(values = cbbPalette[c(2, 1)]) +
+      labs(x = "", y = "Treatment effect", colour = "") +
+      theme(legend.position = "top")
+    # plot(fit, pars = "ATE_agg")
+}
+```
+
+## Trend
+
+- `beta` is the trend smoothing factor.
+If `beta=0`, the trend does not change (constant).
+
+```{r estimates-trend1}
+if (model$include_trend) {
+  plot(fit, pars = "beta") + coord_cartesian(xlim = c(0, 1))
+}
+```
+
+The plot shows the expected trend for four patients.
+
+```{r estimates-trend}
+if (model$include_trend) {
+  
+  expected_trajectory <- function(fit, par_name, id) {
+    traj <- rstan::extract(fit, pars = par_name)[[1]]
+    
+    mean_traj <- apply(traj, c(2, 3), mean)
+    mean_traj <- as.data.frame(mean_traj)
+    colnames(mean_traj) <- paste0("Item_", 1:model$D)
+    mean_traj <- bind_cols(id, mean_traj) %>%
+      pivot_longer(cols = starts_with("Item_"), names_to = "ItemID", values_to = par_name) %>%
+      mutate(ItemID = gsub("Item_", "", ItemID) %>% as.numeric())
+    
+    return(mean_traj)
+  }
+  
+  mean_trend <- expected_trajectory(fit, "trend", id) %>%
+    left_join(model$item_spec, by = "ItemID") %>%
+    mutate(trend = trend / M)
+  
+  p_trend <- lapply(sort(sample(pt, 4)),
+         function(pid) {
+           mean_trend %>%
+             filter(Patient == pid) %>%
+             ggplot(aes(x = Time, y = trend, colour = Name)) +
+             geom_line() +
+             coord_cartesian(ylim = c(-1, 1)) +
+             labs(title = paste0("Patient ", pid), colour = "") +
+             theme(legend.position = "none")
+         })
+  
+  plot_grid(get_legend(p_trend[[1]] + theme(legend.position = "top")),
+            plot_grid(plotlist = p_trend, ncol = 2),
+            ncol = 1, rel_heights = c(.1, .9))
+}
+```
+
+```{r range-trend, message=FALSE}
+if (model$include_trend) {
+  
+  mean_trend %>%
+    group_by(Patient, Name) %>%
+    summarise(Min = min(trend), Max = max(trend)) %>%
+    mutate(Patient = factor(Patient)) %>%
+    ggplot(aes(x = Patient, ymin = Min, ymax = Max, colour = Name)) +
+    geom_errorbar(position = position_dodge(width = .7)) +
+    coord_flip(ylim = c(-.01, .01)) +
+    labs(y = "Range of the (normalised) expected trend", colour = "")
+  # ggsave(here("results", "trend_range.jpg"), width = 13, height = 8, units = "cm", dpi = 300, scale = 2.5)
+  
+}
+```
+
+# Posterior predictive checks
+
+```{r ppc, eval=FALSE}
+yrep <- rstan::extract(fit, pars = "y_rep")[[1]]
+aggrep <- rstan::extract(fit, pars = "agg_rep")[[1]]
+df_agg <- POSCORAD %>%
+  rename(Score = all_of(detail_POSCORAD(score)$Label)) %>%
+  select(Patient, Time, Score) %>%
+  drop_na()
+pl <- lapply(pt,
+             function(pid) {
+               
+               if (model$include_calibration) {
+                 cal_time <- scorad %>% filter(Patient == pid) %>% pull(Time)
+               }
+               
+               # Breakdown
+               pl <- lapply(1:model$D,
+                            function(d) {
+                              tmp <- model$item_spec %>% filter(ItemID == d)
+                              reso <- tmp[["Resolution"]]
+                              M <- tmp[["Maximum"]] / tmp[["Resolution"]]
+                              yrep_d <- yrep[, , d] * reso
+                              sub_df <- df %>% filter(ItemID == d, Patient == pid)
+                              if (M < 20) {
+                                p <- plot_post_traj_pmf(yrep_d,
+                                                        id = id,
+                                                        patient_id = pid,
+                                                        max_score = tmp[["Maximum"]])
+                              } else {
+                                p <- plot_post_traj_fanchart(yrep_d,
+                                                             id = id,
+                                                             patient_id = pid,
+                                                             max_score = tmp[["Maximum"]],
+                                                             legend_fill = "discrete",
+                                                             CI_level = seq(.1, .9, .2))
+                              }
+                              p <- p +
+                                geom_point(data = sub_df,
+                                           aes(x = Time, y = Score)) +
+                                geom_path(data = sub_df,
+                                          aes(x = Time, y = Score)) +
+                                labs(y = tmp$Label)
+                              
+                              if (model$include_calibration) {
+                                p <- p + geom_vline(xintercept = cal_time, colour = "black")
+                              }
+                              
+                              return(p)
+                            })
+               # Aggregate
+               sub_df_agg <- filter(df_agg, Patient == pid)
+               p_agg <- plot_post_traj_fanchart(aggrep[, , 4], # SCORAD
+                                                id = id,
+                                                patient_id = pid,
+                                                max_score = detail_POSCORAD(score)$Maximum,
+                                                legend_fill = "discrete",
+                                                CI_level = seq(.1, .9, .2)) +
+                 geom_point(data = sub_df_agg,
+                            aes(x = Time, y = Score)) +
+                 geom_path(data = sub_df_agg,
+                           aes(x = Time, y = Score)) +
+                 labs(y = score)
+               
+               if (model$include_calibration) {
+                 p_agg <- p_agg + geom_vline(xintercept = cal_time, colour = "black")
+               }
+               
+               plot_title <- ggdraw() +
+                 draw_label(paste0("Patient ", pid),
+                            fontface = "bold",
+                            size = 20,
+                            x = .5,
+                            hjust = 0) +
+                 theme(plot.margin = margin(0, 0, 0, 7))
+               
+               plot_grid(plot_title,
+                         plot_grid(plotlist = pl, ncol = 1, align = "v"),
+                         p_agg,
+                         ncol = 1,
+                         rel_heights = c(.5, 8, 2), align = "v")
+             })
+
+if (FALSE) {
+  for (i in seq_along(pt)) {
+    ggsave(filename = here("results", paste0(score, "_", model$name, "_", sprintf("%02d", pt[i]), ".jpg")),
+           plot = pl[[i]],
+           width = 10,
+           height = 15,
+           units = "cm",
+           dpi = 300,
+           scale = 3.5,
+           bg = "white")
+  }
+}
+```
+
+```{r ppc-scorad-only, eval=FALSE}
+aggrep <- rstan::extract(fit, pars = "agg_rep")[[1]]
+df_agg <- POSCORAD %>%
+  rename(Score = all_of(detail_POSCORAD(score)$Label)) %>%
+  select(Patient, Time, Score) %>%
+  drop_na()
+
+pl <- lapply(pt,
+             function(pid) {
+               sub_df_agg <- filter(df_agg, Patient == pid)
+               
+               p_agg <- plot_post_traj_fanchart(aggrep[, , 4], # SCORAD
+                                                id = id,
+                                                patient_id = pid,
+                                                max_score = 55,
+                                                legend_fill = "discrete",
+                                                CI_level = seq(.1, .9, .2)) +
+                 geom_point(data = sub_df_agg,
+                            aes(x = Time, y = Score)) +
+                 geom_path(data = sub_df_agg,
+                           aes(x = Time, y = Score)) +
+                 labs(y = score, title = paste0("Patient ", pid))
+             })
+
+
+plot_grid(plotlist = pl[sort(sample(pt, 4))],
+          ncol = 2)
+
+
+if (FALSE) {
+  for (i in seq_along(pt)) {
+    ggsave(filename = here("results", paste0(score, "-only_", model$name, "_", sprintf("%02d", pt[i]), ".jpg")),
+           plot = pl[[i]],
+           width = 12,
+           height = 7,
+           units = "cm",
+           dpi = 300,
+           scale = 1.8,
+           bg = "white")
+  }
+}
+
+```
+
+```{r ppc-links2, results='asis'}
+img <- data.frame(Patient = pt) %>%
+  mutate(File = file.path("results", paste0(score, "_", model$name, "_", sprintf("%02d", Patient), ".jpg"))) %>%
+  filter(file.exists(here(File))) %>%
+  mutate(Link = file.path("..", File),
+         Link = gsub("\\+", "%2B", Link),
+         # Link = paste0("![](", Link, ")")) %>%
+         Link = paste0("- [Patient ", Patient, "](", Link, ")")) %>%
+  pull(Link) %>%
+  cat(sep = "\n")
+# NB: printing of images does not always work, so just put the links
+```
+
+NB: the plots are not generated during the report generation but beforehand.
+If nothing appears, it may be because the plots are not saved (files not found).
